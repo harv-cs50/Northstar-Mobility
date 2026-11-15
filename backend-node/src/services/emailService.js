@@ -1,58 +1,85 @@
-import nodemailer from 'nodemailer';
-import { isValidEmail, loadSmtpConfig } from './smtpConfig.js';
+
+import { Resend } from 'resend';
+import { isValidEmail } from './emailValidation.js';
 
 export class EmailService {
-  constructor({ environment = process.env, transportFactory = nodemailer.createTransport } = {}) {
+  constructor({
+    environment = process.env,
+    resendFactory = (apiKey) => new Resend(apiKey),
+  } = {}) {
     this.environment = environment;
-    this.transportFactory = transportFactory;
+    this.resendFactory = resendFactory;
   }
 
   async sendInvoice(recipient, invoiceId, pdfBytes) {
-    if (!isValidEmail(recipient)) throw new Error('Invoice recipient email is invalid');
-    if (typeof invoiceId !== 'string' || !invoiceId || /[\/\\\r\n]/.test(invoiceId)) {
+    if (!isValidEmail(recipient)) {
+      throw new Error('Invoice recipient email is invalid');
+    }
+
+    if (
+      typeof invoiceId !== 'string' ||
+      !invoiceId ||
+      /[\/\\\r\n]/.test(invoiceId)
+    ) {
       throw new Error('Invoice ID is not valid for an email attachment');
     }
-    const attachment = Buffer.isBuffer(pdfBytes) ? pdfBytes : Buffer.from(pdfBytes ?? []);
-    if (attachment.length < 5 || attachment.subarray(0, 5).toString('ascii') !== '%PDF-') {
+
+    const attachment = Buffer.isBuffer(pdfBytes)
+      ? pdfBytes
+      : Buffer.from(pdfBytes ?? []);
+
+    if (
+      attachment.length < 5 ||
+      attachment.subarray(0, 5).toString('ascii') !== '%PDF-'
+    ) {
       throw new Error('Invoice email attachment is not a valid PDF');
     }
 
-    const config = loadSmtpConfig(this.environment);
-    let transport;
+    const apiKey = this.environment.RESEND_API_KEY;
+    const fromEmail = this.environment.RESEND_FROM_EMAIL;
+    const fromName = this.environment.RESEND_FROM_NAME || 'Northstar Mobility';
+
+    if (typeof apiKey !== 'string' || !apiKey.trim()) {
+      throw new Error('Resend API key is not configured');
+    }
+
+    if (!isValidEmail(fromEmail)) {
+      throw new Error('Resend sender email is invalid');
+    }
+
+    if (
+      typeof fromName !== 'string' ||
+      !fromName.trim() ||
+      /[\r\n]/.test(fromName)
+    ) {
+      throw new Error('Resend sender name is invalid');
+    }
+
     try {
-      transport = this.transportFactory({
-        host: config.host,
-        port: config.port,
-        secure: config.security === 'ssl',
-        requireTLS: config.security === 'starttls',
-        auth: { user: config.username, pass: config.password },
-        connectionTimeout: config.timeoutSeconds * 1000,
-        greetingTimeout: config.timeoutSeconds * 1000,
-        socketTimeout: config.timeoutSeconds * 1000,
-        tls: { minVersion: 'TLSv1.2' },
-        logger: false,
-        debug: false,
-      });
-      await transport.sendMail({
-        from: { name: config.fromName, address: config.fromEmail },
-        to: recipient,
+      const resend = this.resendFactory(apiKey);
+
+      const { error } = await resend.emails.send({
+        from: `${fromName} <${fromEmail}>`,
+        to: [recipient],
         subject: `Your vehicle rental invoice ${invoiceId}`,
-        text: `Hello,\n\nYour vehicle rental invoice ${invoiceId} is attached as a PDF.\n\nThis application uses simulated payments; no real payment was processed.\n`,
-        attachments: [{
-          filename: `invoice-${invoiceId}.pdf`,
-          content: attachment,
-          contentType: 'application/pdf',
-        }],
+        text:
+          `Hello,\n\n` +
+          `Your vehicle rental invoice ${invoiceId} is attached as a PDF.\n\n` +
+          `This application uses simulated payments; no real payment was processed.\n`,
+        attachments: [
+          {
+            filename: `invoice-${invoiceId}.pdf`,
+            content: attachment,
+            contentType: 'application/pdf',
+          },
+        ],
       });
-    } catch {
-      // Never forward SMTP library errors; they may contain server or credential details.
-      throw new Error('SMTP server did not accept the invoice message');
-    } finally {
-      try {
-        transport?.close?.();
-      } catch {
-        // Closing a transport does not alter the recorded delivery result.
+
+      if (error) {
+        throw new Error('Resend rejected the invoice message');
       }
+    } catch {
+      throw new Error('Resend server did not accept the invoice message');
     }
   }
 }

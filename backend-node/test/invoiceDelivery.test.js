@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
+import PDFDocument from 'pdfkit';
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config/env.js';
+import { InvoiceRepository } from '../src/repositories/invoiceRepository.js';
+import { SessionRepository } from '../src/repositories/sessionRepository.js';
 import { EmailService } from '../src/services/emailService.js';
 import { InvoiceDeliveryService } from '../src/services/invoiceDeliveryService.js';
 import { generateInvoicePdf } from '../src/services/invoicePdfGenerator.js';
-import { loadSmtpConfig } from '../src/services/smtpConfig.js';
-import { InvoiceRepository } from '../src/repositories/invoiceRepository.js';
-import { SessionRepository } from '../src/repositories/sessionRepository.js';
 import { FakePostgres } from '../test-support/fakePostgres.js';
 
 const apiEnvironment = {
@@ -19,46 +19,80 @@ const apiEnvironment = {
   ALLOWED_ORIGIN: 'http://localhost:5173',
 };
 
-const smtpEnvironment = {
-  VRMS_SMTP_HOST: 'smtp.example.test',
-  VRMS_SMTP_PORT: '587',
-  VRMS_SMTP_USERNAME: 'smtp-test-user',
-  VRMS_SMTP_PASSWORD: 'smtp-test-secret',
-  VRMS_SMTP_FROM_EMAIL: 'invoices@example.test',
-  VRMS_SMTP_FROM_NAME: 'Northstar Mobility',
-  VRMS_SMTP_SECURITY: 'starttls',
-  VRMS_SMTP_TIMEOUT_SECONDS: '20',
-};
-
 const invoiceDocument = {
-  invoiceId: 'INV-PDF-001',
-  bookingId: 'BK-PDF-001',
-  customerId: 'CUST-PDF-001',
-  customerName: 'Jamie Customer',
-  customerEmail: 'jamie@example.test',
-  vehicleId: 'CAR-PDF-001',
+  invoiceId: 'INV-TEST-100',
+  bookingId: 'BOOK-TEST-100',
+  customerId: 'CUST-TEST-100',
+  customerName: 'Jordan Taylor',
+  customerEmail: 'jordan@example.test',
+  vehicleId: 'CAR-TEST-100',
   vehicleBrand: 'Toyota',
   vehicleModel: 'Camry',
   vehicleType: 'Car',
-  rentalStartDate: '2026-09-01',
-  rentalEndDate: '2026-09-06',
-  durationDays: 5,
-  dailyRate: 1800,
-  subtotal: 9000,
-  discount: 500,
-  tax: 1530,
-  total: 10030,
+  rentalStartDate: '2026-12-02',
+  rentalEndDate: '2026-12-05',
+  durationDays: 4,
+  dailyRate: 1000,
+  subtotal: 4000,
+  discount: 100,
+  tax: 390,
+  total: 4290,
   paymentStatus: 'Successful',
 };
+
+const fakeResendEnvironment = {
+  RESEND_API_KEY: 're_test_fake_key_1234567890',
+  RESEND_FROM_EMAIL: 'billing@northstar.example',
+  RESEND_FROM_NAME: 'Northstar Mobility',
+};
+
+const samplePdf = Buffer.from('%PDF-1.4\nmock invoice bytes\n%%EOF', 'ascii');
+
+class FakeInvoiceRepository {
+  constructor({ emailStatus = 'PENDING', invoice = invoiceDocument } = {}) {
+    this.emailStatus = emailStatus;
+    this.invoice = invoice;
+    this.emailAttempts = 0;
+    this.claims = 0;
+  }
+
+  async claimInvoiceEmail(invoiceId) {
+    if (invoiceId !== this.invoice.invoiceId ||
+        !['PENDING', 'FAILED'].includes(this.emailStatus)) return false;
+    this.claims += 1;
+    this.emailAttempts += 1;
+    this.emailStatus = 'SENDING';
+    return true;
+  }
+
+  async getInvoiceEmailStatus(invoiceId) {
+    return invoiceId === this.invoice.invoiceId ? this.emailStatus : null;
+  }
+
+  async loadInvoiceDocument(invoiceId) {
+    return invoiceId === this.invoice.invoiceId ? this.invoice : null;
+  }
+
+  async markInvoiceEmailSent(invoiceId) {
+    if (invoiceId !== this.invoice.invoiceId || this.emailStatus !== 'SENDING') {
+      throw new Error('Unexpected email state');
+    }
+    if (this.failSentUpdate) throw new Error('simulated state persistence failure');
+    this.emailStatus = 'SENT';
+  }
+
+  async markInvoiceEmailFailed(invoiceId) {
+    if (invoiceId !== this.invoice.invoiceId || this.emailStatus !== 'SENDING') {
+      throw new Error('Unexpected email state');
+    }
+    this.emailStatus = 'FAILED';
+  }
+}
 
 const servers = new Set();
 
 async function startApp(database, emailService) {
-  const app = createApp({
-    config: loadConfig(apiEnvironment),
-    database,
-    emailService,
-  });
+  const app = createApp({ config: loadConfig(apiEnvironment), database, emailService });
   const server = app.listen(0, '127.0.0.1');
   servers.add(server);
   await new Promise((resolve, reject) => {
@@ -69,12 +103,7 @@ async function startApp(database, emailService) {
 }
 
 async function tokenFor(database, userId, role = 'CUSTOMER') {
-  database.seedUser({
-    user_id: userId,
-    role,
-    name: userId,
-    email: `${userId}@example.test`,
-  });
+  database.seedUser({ user_id: userId, role, name: userId, email: `${userId}@example.test` });
   return new SessionRepository(database).createSession(userId, role);
 }
 
@@ -90,284 +119,286 @@ async function request(baseUrl, path, { method = 'GET', body, token } = {}) {
   return { response, body: await response.json() };
 }
 
-function seedDeliveryRecords(database, {
-  invoiceId = 'INV-DELIVERY-001',
-  bookingId = 'BK-DELIVERY-001',
-  customerId = 'delivery-customer',
-  status = 'PENDING',
-} = {}) {
-  database.seedUser({
-    user_id: customerId,
-    name: 'Jamie Customer',
-    email: 'jamie@example.test',
-    role: 'CUSTOMER',
-  });
-  database.seedVehicle({
-    vehicle_id: 'CAR-DELIVERY-001',
-    brand: 'Toyota',
-    model: 'Camry',
-    vehicle_type: 'Car',
-    daily_rate: '1800.00',
-    is_available: true,
-  });
-  database.seedBooking({
-    booking_id: bookingId,
-    customer_id: customerId,
-    vehicle_id: 'CAR-DELIVERY-001',
-    start_date: '2026-09-01',
-    end_date: '2026-09-06',
-    status: 'CONFIRMED',
-  });
-  database.payments.set(`PAY-${bookingId}`, {
-    payment_id: `PAY-${bookingId}`,
-    booking_id: bookingId,
-    amount: '9000.00',
-    payment_method: 'UPI',
-    payment_status: 'Successful',
-  });
-  database.invoices.set(invoiceId, {
-    invoice_id: invoiceId,
-    booking_id: bookingId,
-    subtotal: '9000.00',
-    discount: '0.00',
-    tax: '0.00',
-    total_amount: '9000.00',
-    email_status: status,
-    email_attempts: status === 'FAILED' ? 1 : 0,
-    email_last_attempt_at: null,
-    email_sent_at: null,
-    email_last_error: status === 'FAILED' ? 'previous safe failure' : null,
-  });
-}
-
 afterEach(async () => {
   await Promise.all([...servers].map((server) => new Promise((resolve) => {
-    server.close(() => resolve());
+    server.close(resolve);
   })));
   servers.clear();
 });
 
 describe('invoice PDF generation', () => {
-  it('creates a PDF containing customer, booking, vehicle, rental, amount and payment details', async () => {
-    const pdf = await generateInvoicePdf(invoiceDocument);
-    const content = [...pdf.toString('latin1').matchAll(/<([0-9a-fA-F]+)>/g)]
-      .map((match) => Buffer.from(match[1], 'hex').toString('latin1'))
-      .join('');
+  it('creates a PDF with customer, booking, vehicle, rental, amount, and payment details', async () => {
+    const recordedText = [];
+    const originalText = PDFDocument.prototype.text;
+    PDFDocument.prototype.text = function recordPdfText(value, ...args) {
+      if (typeof value === 'string') recordedText.push(value);
+      return originalText.call(this, value, ...args);
+    };
+    let pdf;
+    try {
+      pdf = await generateInvoicePdf(invoiceDocument);
+    } finally {
+      PDFDocument.prototype.text = originalText;
+    }
+    const content = recordedText.join('\n');
 
     assert.equal(pdf.subarray(0, 5).toString('ascii'), '%PDF-');
     for (const required of [
-      'NORTHSTAR MOBILITY', 'INV-PDF-001', 'Jamie Customer', 'jamie@example.test',
-      'CUST-PDF-001', 'BK-PDF-001', 'Toyota Camry (Car)', 'CAR-PDF-001',
-      '2026-09-01 to 2026-09-06', '5 days x INR 1800.00 / day',
-      'INR 9000.00', 'INR 500.00', 'INR 1530.00', 'INR 10030.00', 'Successful',
-      'simulated payments; no real charge was made',
+      'Jordan Taylor', 'jordan@example.test', 'BOOK-TEST-100', 'Toyota Camry',
+      'CAR-TEST-100', '2026-12-02 to 2026-12-05', '4 days',
+      'INR 1000.00 / day', 'INR 4000.00', 'INR 100.00', 'INR 390.00',
+      'INR 4290.00', 'Successful',
     ]) {
       assert.ok(content.includes(required), `PDF is missing ${required}`);
     }
   });
 });
 
-describe('SMTP invoice email service', () => {
-  it('uses environment configuration, STARTTLS and a PDF attachment', async () => {
-    let transportOptions;
-    let mail;
-    const email = new EmailService({
-      environment: smtpEnvironment,
-      transportFactory(options) {
-        transportOptions = options;
+describe('Resend invoice email service', () => {
+  it('sends a PDF attachment through the injected Resend SDK client', async () => {
+    let receivedKey;
+    let sentOptions;
+    const service = new EmailService({
+      environment: fakeResendEnvironment,
+      resendFactory(apiKey) {
+        receivedKey = apiKey;
         return {
-          async sendMail(message) { mail = message; },
-          close() {},
+          emails: {
+            async send(options) {
+              sentOptions = options;
+              return { data: { id: 'email_test_123' }, error: null };
+            },
+          },
         };
       },
     });
-    const pdf = Buffer.from('%PDF-test-invoice');
 
-    await email.sendInvoice('customer@example.test', 'INV-SMTP-001', pdf);
+    await service.sendInvoice('jordan@example.test', 'INV-TEST-100', samplePdf);
 
-    assert.equal(transportOptions.host, smtpEnvironment.VRMS_SMTP_HOST);
-    assert.equal(transportOptions.port, 587);
-    assert.equal(transportOptions.secure, false);
-    assert.equal(transportOptions.requireTLS, true);
-    assert.equal(transportOptions.auth.user, smtpEnvironment.VRMS_SMTP_USERNAME);
-    assert.equal(transportOptions.auth.pass, smtpEnvironment.VRMS_SMTP_PASSWORD);
-    assert.equal(transportOptions.logger, false);
-    assert.equal(transportOptions.debug, false);
-    assert.deepEqual(mail.from, {
-      name: 'Northstar Mobility',
-      address: 'invoices@example.test',
+    assert.equal(receivedKey, fakeResendEnvironment.RESEND_API_KEY);
+    assert.deepEqual(sentOptions, {
+      from: 'Northstar Mobility <billing@northstar.example>',
+      to: ['jordan@example.test'],
+      subject: 'Your vehicle rental invoice INV-TEST-100',
+      text: 'Hello,\n\nYour vehicle rental invoice INV-TEST-100 is attached as a PDF.\n\n'
+        + 'This application uses simulated payments; no real payment was processed.\n',
+      attachments: [{
+        filename: 'invoice-INV-TEST-100.pdf',
+        content: samplePdf,
+        contentType: 'application/pdf',
+      }],
     });
-    assert.equal(mail.to, 'customer@example.test');
-    assert.equal(mail.attachments.length, 1);
-    assert.equal(mail.attachments[0].filename, 'invoice-INV-SMTP-001.pdf');
-    assert.equal(mail.attachments[0].contentType, 'application/pdf');
-    assert.deepEqual(mail.attachments[0].content, pdf);
   });
 
-  it('sanitizes SMTP failures and reports missing configuration without echoing secrets', async () => {
-    const secret = 'smtp-password-must-not-appear';
-    const email = new EmailService({
-      environment: { ...smtpEnvironment, VRMS_SMTP_PASSWORD: secret },
-      transportFactory: () => ({
-        async sendMail() { throw new Error(`authentication failed: ${secret}`); },
-      }),
-    });
-    await assert.rejects(
-      email.sendInvoice('customer@example.test', 'INV-SMTP-ERR', Buffer.from('%PDF-test')),
-      (error) => {
-        assert.equal(error.message, 'SMTP server did not accept the invoice message');
-        assert.equal(error.message.includes(secret), false);
-        return true;
+  it('rejects a missing Resend API key without constructing or calling the SDK', async () => {
+    let factoryCalled = false;
+    const service = new EmailService({
+      environment: { ...fakeResendEnvironment, RESEND_API_KEY: '' },
+      resendFactory() {
+        factoryCalled = true;
+        throw new Error('should not be called');
       },
-    );
-
-    const factoryFailure = new EmailService({
-      environment: smtpEnvironment,
-      transportFactory() { throw new Error(`private configuration ${secret}`); },
     });
+
     await assert.rejects(
-      factoryFailure.sendInvoice('customer@example.test', 'INV-SMTP-FACTORY', Buffer.from('%PDF-test')),
-      (error) => {
-        assert.equal(error.message, 'SMTP server did not accept the invoice message');
-        assert.equal(error.message.includes(secret), false);
-        return true;
-      },
+      service.sendInvoice('jordan@example.test', 'INV-TEST-100', samplePdf),
+      { message: 'Resend API key is not configured' },
     );
+    assert.equal(factoryCalled, false);
+  });
 
-    assert.throws(() => loadSmtpConfig({ VRMS_SMTP_PASSWORD: secret }), (error) => {
-      assert.match(error.message, /VRMS_SMTP_HOST/);
-      assert.equal(error.message.includes(secret), false);
-      return true;
+  it('sanitizes provider-reported errors and thrown SDK errors', async (t) => {
+    await t.test('provider error response', async () => {
+      const service = new EmailService({
+        environment: fakeResendEnvironment,
+        resendFactory: () => ({
+          emails: {
+            async send() {
+              return { data: null, error: { message: 'private provider response and secret detail' } };
+            },
+          },
+        }),
+      });
+
+      await assert.rejects(
+        service.sendInvoice('jordan@example.test', 'INV-TEST-100', samplePdf),
+        (error) => {
+          assert.equal(error.message, 'Resend server did not accept the invoice message');
+          assert.doesNotMatch(error.message, /private provider|secret detail|re_test_fake_key/i);
+          return true;
+        },
+      );
     });
+
+    await t.test('thrown SDK error', async () => {
+      const service = new EmailService({
+        environment: fakeResendEnvironment,
+        resendFactory: () => ({
+          emails: {
+            async send() {
+              throw new Error('request failed with re_test_fake_key_1234567890 and private details');
+            },
+          },
+        }),
+      });
+
+      await assert.rejects(
+        service.sendInvoice('jordan@example.test', 'INV-TEST-100', samplePdf),
+        (error) => {
+          assert.equal(error.message, 'Resend server did not accept the invoice message');
+          assert.doesNotMatch(error.message, /re_test_fake_key|private details/i);
+          return true;
+        },
+      );
+    });
+  });
+
+  it('validates recipient, invoice ID, and PDF before calling Resend', async () => {
+    let factoryCalls = 0;
+    const service = new EmailService({
+      environment: fakeResendEnvironment,
+      resendFactory() {
+        factoryCalls += 1;
+        return { emails: { async send() { return { data: { id: 'unused' }, error: null }; } } };
+      },
+    });
+
+    await assert.rejects(service.sendInvoice('invalid-address', 'INV-1', samplePdf), /recipient email is invalid/);
+    await assert.rejects(service.sendInvoice('jordan@example.test', 'INV/1', samplePdf), /Invoice ID is not valid/);
+    await assert.rejects(service.sendInvoice('jordan@example.test', 'INV-1', Buffer.from('not a PDF')), /not a valid PDF/);
+    assert.equal(factoryCalls, 0);
   });
 });
 
-describe('invoice email delivery state', () => {
-  it('claims PENDING atomically, marks SENT, and prevents another send', async () => {
-    const database = new FakePostgres();
-    seedDeliveryRecords(database);
-    let sends = 0;
-    const delivery = new InvoiceDeliveryService({
-      repository: new InvoiceRepository(database),
-      emailService: { async sendInvoice(recipient, invoiceId, pdf) {
-        sends += 1;
-        assert.equal(recipient, 'jamie@example.test');
-        assert.equal(invoiceId, 'INV-DELIVERY-001');
-        assert.equal(pdf.subarray(0, 5).toString('ascii'), '%PDF-');
-      } },
+describe('invoice delivery state and retry behavior', () => {
+  it('generates and attaches a PDF, then persists SENT', async () => {
+    const repository = new FakeInvoiceRepository();
+    let sent;
+    const service = new InvoiceDeliveryService({
+      repository,
+      emailService: {
+        async sendInvoice(recipient, invoiceId, pdf) {
+          sent = { recipient, invoiceId, pdf };
+        },
+      },
     });
 
-    const sent = await delivery.sendInvoice('INV-DELIVERY-001');
-    const duplicate = await delivery.sendInvoice('INV-DELIVERY-001');
+    const result = await service.sendInvoice(invoiceDocument.invoiceId);
 
-    assert.equal(sent.status, 'SENT');
-    assert.equal(sent.sent, true);
-    assert.equal(duplicate.status, 'SENT');
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_attempts, 1);
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_sent_at !== null, true);
-    assert.equal(sends, 1);
+    assert.equal(result.status, 'SENT');
+    assert.equal(result.sent, true);
+    assert.equal(repository.emailStatus, 'SENT');
+    assert.equal(repository.emailAttempts, 1);
+    assert.equal(sent.recipient, invoiceDocument.customerEmail);
+    assert.equal(sent.invoiceId, invoiceDocument.invoiceId);
+    assert.equal(sent.pdf.subarray(0, 5).toString('ascii'), '%PDF-');
   });
 
-  it('records FAILED safely and allows a later retry to reach SENT', async () => {
-    const database = new FakePostgres();
-    seedDeliveryRecords(database);
-    let shouldFail = true;
-    const delivery = new InvoiceDeliveryService({
-      repository: new InvoiceRepository(database),
-      emailService: { async sendInvoice() {
-        if (shouldFail) throw new Error('private SMTP response with credential data');
-      } },
-    });
-
-    const failed = await delivery.sendInvoice('INV-DELIVERY-001');
-    assert.equal(failed.status, 'FAILED');
-    assert.match(failed.message, /administrator can retry/);
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_attempts, 1);
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_last_error,
-      'SMTP delivery failed; check server logs and configuration');
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_last_error.includes('credential'), false);
-
-    shouldFail = false;
-    const retried = await delivery.sendInvoice('INV-DELIVERY-001');
-    assert.equal(retried.status, 'SENT');
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_attempts, 2);
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_last_error, null);
-  });
-
-  it('allows only one concurrent delivery claim and avoids duplicate sends', async () => {
-    const database = new FakePostgres();
-    seedDeliveryRecords(database);
+  it('records FAILED safely and allows a retry to reach SENT', async () => {
+    const repository = new FakeInvoiceRepository();
     let sendCount = 0;
-    let enteredSend;
-    const sending = new Promise((resolve) => { enteredSend = resolve; });
-    let finishSend;
-    const heldSend = new Promise((resolve) => { finishSend = resolve; });
-    const delivery = new InvoiceDeliveryService({
-      repository: new InvoiceRepository(database),
-      pdfGenerator: async () => Buffer.from('%PDF-concurrent'),
-      emailService: { async sendInvoice() {
-        sendCount += 1;
-        enteredSend();
-        await heldSend;
-      } },
+    const service = new InvoiceDeliveryService({
+      repository,
+      pdfGenerator: async () => samplePdf,
+      emailService: {
+        async sendInvoice() {
+          sendCount += 1;
+          if (sendCount === 1) throw new Error('private Resend key and provider response');
+        },
+      },
     });
 
-    const firstPromise = delivery.sendInvoice('INV-DELIVERY-001');
-    await sending;
-    const concurrent = await delivery.sendInvoice('INV-DELIVERY-001');
-    assert.equal(concurrent.status, 'SENDING');
-    assert.equal(sendCount, 1);
-    finishSend();
-    const first = await firstPromise;
-    assert.equal(first.status, 'SENT');
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_attempts, 1);
-    assert.equal(sendCount, 1);
+    const failed = await service.sendInvoice(invoiceDocument.invoiceId);
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.sent, false);
+    assert.equal(repository.emailStatus, 'FAILED');
+    assert.equal(repository.emailAttempts, 1);
+    assert.doesNotMatch(JSON.stringify(failed), /private Resend key|provider response/i);
+
+    const retried = await service.sendInvoice(invoiceDocument.invoiceId);
+    assert.equal(retried.status, 'SENT');
+    assert.equal(repository.emailStatus, 'SENT');
+    assert.equal(repository.emailAttempts, 2);
+    assert.equal(sendCount, 2);
   });
 
-  it('keeps SENDING if SMTP accepted the message but SENT persistence fails', async () => {
-    const database = new FakePostgres();
-    seedDeliveryRecords(database);
-    database.failInvoiceStatusUpdate = true;
-    let sends = 0;
-    const delivery = new InvoiceDeliveryService({
-      repository: new InvoiceRepository(database),
-      pdfGenerator: async () => Buffer.from('%PDF-status-write'),
-      emailService: { async sendInvoice() { sends += 1; } },
+  it('atomically prevents concurrent and duplicate sends', async () => {
+    const repository = new FakeInvoiceRepository();
+    let sendCount = 0;
+    let releaseSend;
+    let signalStarted;
+    const started = new Promise((resolve) => { signalStarted = resolve; });
+    const blockedSend = new Promise((resolve) => { releaseSend = resolve; });
+    const service = new InvoiceDeliveryService({
+      repository,
+      pdfGenerator: async () => samplePdf,
+      emailService: {
+        async sendInvoice() {
+          sendCount += 1;
+          signalStarted();
+          await blockedSend;
+        },
+      },
     });
 
-    const first = await delivery.sendInvoice('INV-DELIVERY-001');
-    database.failInvoiceStatusUpdate = false;
-    const retry = await delivery.sendInvoice('INV-DELIVERY-001');
+    const firstAttempt = service.sendInvoice(invoiceDocument.invoiceId);
+    await started;
+    const concurrentAttempt = await service.sendInvoice(invoiceDocument.invoiceId);
+    assert.equal(concurrentAttempt.status, 'SENDING');
+    assert.equal(concurrentAttempt.sent, false);
+
+    releaseSend();
+    assert.equal((await firstAttempt).status, 'SENT');
+    const duplicateAttempt = await service.sendInvoice(invoiceDocument.invoiceId);
+    assert.equal(duplicateAttempt.status, 'SENT');
+    assert.equal(duplicateAttempt.sent, false);
+    assert.equal(sendCount, 1);
+    assert.equal(repository.emailAttempts, 1);
+  });
+
+  it('keeps SENDING when the provider accepted the PDF but SENT persistence fails', async () => {
+    const repository = new FakeInvoiceRepository();
+    repository.failSentUpdate = true;
+    let sendCount = 0;
+    const service = new InvoiceDeliveryService({
+      repository,
+      pdfGenerator: async () => samplePdf,
+      emailService: { async sendInvoice() { sendCount += 1; } },
+    });
+
+    const first = await service.sendInvoice(invoiceDocument.invoiceId);
+    repository.failSentUpdate = false;
+    const retry = await service.sendInvoice(invoiceDocument.invoiceId);
 
     assert.equal(first.status, 'SENDING');
     assert.match(first.message, /Do not resend/);
     assert.equal(retry.status, 'SENDING');
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_status, 'SENDING');
-    assert.equal(database.invoices.get('INV-DELIVERY-001').email_attempts, 1);
-    assert.equal(sends, 1);
+    assert.equal(repository.emailStatus, 'SENDING');
+    assert.equal(repository.emailAttempts, 1);
+    assert.equal(sendCount, 1);
   });
 });
 
 describe('payment email integration and admin retry', () => {
-  it('keeps a successful payment and invoice when SMTP fails', async () => {
+  it('keeps a successful payment and invoice when the email provider fails', async () => {
     const database = new FakePostgres();
-    const customerToken = await tokenFor(database, 'mail-failure-customer');
+    const customerToken = await tokenFor(database, 'email-failure-customer');
     database.seedVehicle({
-      vehicle_id: 'CAR-MAIL-FAIL', brand: 'Honda', model: 'City',
+      vehicle_id: 'CAR-EMAIL-FAIL', brand: 'Honda', model: 'City',
       vehicle_type: 'Car', daily_rate: '1000.00', is_available: true,
     });
     database.seedBooking({
-      booking_id: 'BK-MAIL-FAIL', customer_id: 'mail-failure-customer',
-      vehicle_id: 'CAR-MAIL-FAIL', start_date: '2026-10-01', end_date: '2026-10-03',
+      booking_id: 'BK-EMAIL-FAIL', customer_id: 'email-failure-customer',
+      vehicle_id: 'CAR-EMAIL-FAIL', start_date: '2026-10-01', end_date: '2026-10-03',
       status: 'CONFIRMED',
     });
     const baseUrl = await startApp(database, {
-      async sendInvoice() { throw new Error('private SMTP credential detail'); },
+      async sendInvoice() { throw new Error('private Resend credential detail'); },
     });
 
     const result = await request(baseUrl, '/api/payments', {
       method: 'POST', token: customerToken,
-      body: { bookingId: 'BK-MAIL-FAIL', method: 'UPI' },
+      body: { bookingId: 'BK-EMAIL-FAIL', method: 'UPI' },
     });
 
     assert.equal(result.response.status, 201);
@@ -377,10 +408,10 @@ describe('payment email integration and admin retry', () => {
     assert.equal(database.payments.size, 1);
     assert.equal(database.invoices.size, 1);
     assert.equal(database.invoices.get(result.body.invoiceId).email_status, 'FAILED');
-    assert.equal(database.invoices.get(result.body.invoiceId).email_last_error.includes('credential'), false);
+    assert.doesNotMatch(database.invoices.get(result.body.invoiceId).email_last_error, /credential|Resend/i);
   });
 
-  it('restricts retry to admins and preserves the retry response shape', async () => {
+  it('restricts invoice retry to admins and preserves the retry response', async () => {
     const database = new FakePostgres();
     const customerToken = await tokenFor(database, 'retry-owner-customer');
     const adminToken = await tokenFor(database, 'retry-admin', 'ADMIN');
@@ -396,7 +427,7 @@ describe('payment email integration and admin retry', () => {
     let shouldFail = true;
     const baseUrl = await startApp(database, {
       async sendInvoice() {
-        if (shouldFail) throw new Error('private SMTP credentials');
+        if (shouldFail) throw new Error('private Resend credentials');
       },
     });
     const first = await request(baseUrl, '/api/payments', {

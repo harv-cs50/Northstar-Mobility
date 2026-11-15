@@ -70,7 +70,7 @@ export class InvoiceDeliveryService {
     try {
       await this.repository.markInvoiceEmailSent(invoiceId);
     } catch {
-      // SMTP accepted the message. Keep SENDING so a retry cannot send it twice.
+      // The email provider accepted the message. Keep SENDING so a retry cannot send it twice.
       return {
         status: 'SENDING',
         message: 'The email server accepted the invoice, but delivery status could not be updated. Do not resend until status is checked.',

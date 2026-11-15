@@ -164,7 +164,7 @@ export class InvoiceRepository {
     const result = await this.database.query(
       "UPDATE invoices SET email_status = 'FAILED', email_last_error = $1 "
         + "WHERE invoice_id = $2 AND email_status = 'SENDING' RETURNING invoice_id",
-      ['SMTP delivery failed; check server logs and configuration', invoiceId],
+      ['Email provider delivery failed; check server configuration', invoiceId],
     );
     if (result.rowCount !== 1) {
       throw new Error('Invoice email delivery state could not be marked failed');

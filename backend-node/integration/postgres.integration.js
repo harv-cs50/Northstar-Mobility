@@ -507,7 +507,7 @@ describe(`PostgreSQL integration (${TEST_DATABASE_NAME})`, () => {
     const failedInvoiceId = await createInvoice({ bookingId: failedBooking });
     const failingDelivery = new InvoiceDeliveryService({
       repository: new InvoiceRepository(pool),
-      emailService: { async sendInvoice() { throw new Error('mock SMTP failure'); } },
+      emailService: { async sendInvoice() { throw new Error('mock email provider failure'); } },
     });
     assert.equal((await failingDelivery.sendInvoice(failedInvoiceId)).status, 'FAILED');
     state = await pool.query('SELECT email_status, email_attempts, email_last_error FROM invoices WHERE invoice_id = $1', [failedInvoiceId]);
@@ -525,7 +525,7 @@ describe(`PostgreSQL integration (${TEST_DATABASE_NAME})`, () => {
     assert.equal(state.rows[0].email_attempts, 2);
   });
 
-  it('restricts invoice retry to admins and keeps SMTP mocked', async () => {
+  it('restricts invoice retry to admins and keeps email delivery mocked', async () => {
     const customer = await createCustomer();
     const customerToken = await new SessionRepository(pool).createSession(customer.userId, 'CUSTOMER');
     const vehicleId = await createVehicle();

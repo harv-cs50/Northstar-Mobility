@@ -12,9 +12,9 @@ const mockEmailService = Object.freeze({
   async sendInvoice(_recipient, _invoiceId, pdfBytes) {
     const bytes = Buffer.isBuffer(pdfBytes) ? pdfBytes : Buffer.from(pdfBytes ?? []);
     if (bytes.length < 5 || bytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
-      throw new Error('Mock SMTP rejected a non-PDF invoice attachment');
+      throw new Error('Mock email provider rejected a non-PDF invoice attachment');
     }
-    // Accept the generated attachment locally; no message is sent to an SMTP server.
+    // Accept the generated attachment locally; no email provider is contacted.
   },
 });
 
@@ -66,7 +66,7 @@ async function startE2eMockServer() {
 }
 
   console.log(
-    `E2E mock API listening on ${TEST_HOST}:${config.port}; database verified as ${TEST_DATABASE}. SMTP and Gemini are mocked.`,
+    `E2E mock API listening on ${TEST_HOST}:${config.port}; database verified as ${TEST_DATABASE}. Email and Gemini are mocked.`,
   );
 
   let shutdownPromise;
