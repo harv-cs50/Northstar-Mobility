@@ -1,20 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createVrmsApi } from './api.js';
 
 const getSavedSession = () => {
   try { return JSON.parse(sessionStorage.getItem('vrms-session') || 'null'); }
   catch { return null; }
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
-
-async function api(path, session, options = {}) {
-  const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers };
-  if (session?.sessionId) headers.Authorization = `Bearer ${session.sessionId}`;
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || 'Request could not be completed');
-  return payload;
-}
+const api = createVrmsApi(import.meta.env.VITE_API_BASE_URL || '/api');
 
 const money = (value) => new Intl.NumberFormat('en-IN', {
   style: 'currency', currency: 'INR', maximumFractionDigits: 0,
@@ -75,7 +67,7 @@ function App() {
   const [adminData, setAdminData] = useState({ vehicles: [], bookings: [], maintenance: [], rentals: [], invoices: [] });
 
   const loadVehicles = useCallback(async () => {
-    try { setVehicles(await api('/vehicles')); }
+    try { setVehicles(await api.listVehicles()); }
     catch (error) { setNotice(error.message); }
   }, []);
 
@@ -83,7 +75,7 @@ function App() {
     if (!activeSession) return;
     try {
       const [nextBookings, nextPayments, nextInvoices] = await Promise.all([
-        api('/bookings', activeSession), api('/payments', activeSession), api('/invoices', activeSession),
+        api.listBookings(activeSession), api.listPayments(activeSession), api.listInvoices(activeSession),
       ]);
       setBookings(nextBookings); setPayments(nextPayments); setInvoices(nextInvoices);
     } catch (error) { setNotice(error.message); }
@@ -93,8 +85,8 @@ function App() {
     if (session?.role !== 'ADMIN') return;
     try {
       const [nextVehicles, nextBookings, maintenance, rentals, invoices] = await Promise.all([
-        api('/admin/vehicles', session), api('/admin/bookings', session),
-        api('/admin/maintenance', session), api('/admin/rentals', session), api('/invoices', session),
+        api.listAdminVehicles(session), api.listAdminBookings(session), api.listAdminMaintenance(session),
+        api.listAdminRentals(session), api.listAdminInvoices(session),
       ]);
       setAdminData({ vehicles: nextVehicles, bookings: nextBookings, maintenance, rentals, invoices });
     } catch (error) { setNotice(error.message); }
@@ -109,6 +101,19 @@ function App() {
     );
     try { localStorage.setItem('northstar-theme', theme); } catch { /* theme still works for this page view */ }
   }, [theme]);
+  useEffect(() => {
+    const onSessionExpired = () => {
+      try { sessionStorage.removeItem('vrms-session'); } catch { /* the in-memory session still expires */ }
+      setSession(null);
+      setBookings([]);
+      setPayments([]);
+      setInvoices([]);
+      setAdminData({ vehicles: [], bookings: [], maintenance: [], rentals: [], invoices: [] });
+      setNotice('Your session expired. Sign in again to continue.');
+    };
+    window.addEventListener('vrms:session-expired', onSessionExpired);
+    return () => window.removeEventListener('vrms:session-expired', onSessionExpired);
+  }, []);
 
   const filteredVehicles = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -127,12 +132,12 @@ function App() {
     const form = new FormData(event.currentTarget);
     try {
       if (authMode === 'register') {
-        await api('/auth/register', null, { method: 'POST', body: JSON.stringify({
+        await api.registerCustomer({
           userId: form.get('userId'), name: form.get('name'), email: form.get('email'), password: form.get('password'),
-        }) });
+        });
         setNotice('Account created. Sign in to continue.'); setAuthMode('login');
       } else {
-        const result = await api('/auth/login', null, { method: 'POST', body: JSON.stringify({ email: form.get('email'), password: form.get('password') }) });
+        const result = await api.login({ email: form.get('email'), password: form.get('password') });
         saveSession(result);
       }
     } catch (error) { setNotice(error.message); }
@@ -140,7 +145,7 @@ function App() {
   }
 
   async function logout() {
-    try { await api('/auth/logout', session, { method: 'POST' }); } catch { /* local sign-out still clears an expired session */ }
+    try { await api.logout(session); } catch { /* local sign-out still clears an expired session */ }
     sessionStorage.removeItem('vrms-session'); setSession(null); setBookings([]); setPayments([]); setInvoices([]); setNotice('You are signed out.');
   }
 
@@ -148,7 +153,7 @@ function App() {
     event.preventDefault(); if (!session) { setNotice('Sign in as a customer to book a vehicle.'); setSelected(null); return; }
     setBusy(true);
     try {
-      await api('/bookings', session, { method: 'POST', body: JSON.stringify({ vehicleId: selected.id, ...bookingDates }) });
+      await api.createBooking(session, { vehicleId: selected.id, ...bookingDates });
       setNotice('Booking confirmed.'); setSelected(null); await loadCustomerData(session);
     } catch (error) { setNotice(error.message); }
     finally { setBusy(false); }
@@ -157,7 +162,7 @@ function App() {
   async function pay(bookingId) {
     setBusy(true);
     try {
-      const payment = await api('/payments', session, { method: 'POST', body: JSON.stringify({ bookingId, method: paymentMethod }) });
+      const payment = await api.createPayment(session, { bookingId, method: paymentMethod });
       const deliveryMessage = payment.emailStatus === 'SENT'
         ? `Invoice ${payment.invoiceId} was emailed to your registered address.`
         : payment.emailStatus === 'FAILED'
@@ -171,7 +176,7 @@ function App() {
 
   async function cancelBooking(bookingId) {
     try {
-      await api(`/bookings/${encodeURIComponent(bookingId)}/cancel`, session, { method: 'POST' });
+      await api.cancelBooking(session, bookingId);
       setNotice('Booking cancelled.'); await loadCustomerData(session); await loadAdminData();
     } catch (error) { setNotice(error.message); }
   }
@@ -179,9 +184,9 @@ function App() {
   async function createVehicle(event) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
-      await api('/admin/vehicles', session, { method: 'POST', body: JSON.stringify({
+      await api.createVehicle(session, {
         id: form.get('id'), brand: form.get('brand'), model: form.get('model'), type: form.get('type'), dailyRate: Number(form.get('dailyRate')),
-      }) });
+      });
       event.currentTarget.reset(); setNotice('Vehicle saved.'); await loadAdminData(); await loadVehicles();
     } catch (error) { setNotice(error.message); }
   }
@@ -189,16 +194,16 @@ function App() {
   async function createAdmin(event) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
-      await api('/admin/users', session, { method: 'POST', body: JSON.stringify({
+      await api.createAdminUser(session, {
         userId: form.get('userId'), name: form.get('name'), email: form.get('email'), password: form.get('password'),
-      }) });
+      });
       event.currentTarget.reset(); setNotice('Administrator account created.');
     } catch (error) { setNotice(error.message); }
   }
 
   async function retryInvoiceEmail(invoiceId) {
     try {
-      const result = await api(`/admin/invoices/${encodeURIComponent(invoiceId)}/retry-email`, session, { method: 'POST' });
+      const result = await api.retryInvoiceEmail(session, invoiceId);
       setNotice(result.message || `Invoice email status: ${result.emailStatus}`);
       await loadAdminData();
     } catch (error) { setNotice(error.message); }
@@ -208,9 +213,9 @@ function App() {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
       const token = String(form.get('token') || '');
-      const result = await api('/auth/bootstrap-admin', null, { method: 'POST', headers: { 'X-Admin-Bootstrap-Token': token }, body: JSON.stringify({
+      const result = await api.bootstrapAdmin({
         userId: form.get('userId'), name: form.get('name'), email: form.get('email'), password: form.get('password'),
-      }) });
+      }, token);
       saveSession(result); setShowBootstrap(false); setNotice('Initial administrator provisioned. Store the bootstrap token securely; the database setup is now closed.');
     } catch (error) { setNotice(error.message); }
   }
@@ -334,9 +339,7 @@ function SupportChat({ session }) {
     setInput('');
     setBusy(true);
     try {
-      const response = await api('/chat', session, {
-        method: 'POST', body: JSON.stringify({ message, history }),
-      });
+      const response = await api.sendChat(session, { message, history });
       if (requestId.current === currentId) {
         setMessages((current) => [...current, {
           id: `assistant-${currentId}`, role: 'assistant',
@@ -413,7 +416,7 @@ function AdminDashboard({ session, data, tab, setTab, onCreateVehicle, onCreateA
     <div className="dashboard-heading"><div><p className="eyebrow">ADMIN WORKSPACE</p><h2>Fleet at a <em>glance.</em></h2></div><button className="button button-outline" onClick={refresh}>Refresh data ↻</button></div>
     <div className="stat-row"><Stat label="Vehicles" value={data.vehicles.length} /><Stat label="Bookings" value={data.bookings.length} /><Stat label="In maintenance" value={data.maintenance.filter((item) => item.status === 'SCHEDULED').length} /><Stat label="Active rentals" value={data.rentals.filter((item) => !item.returned).length} /></div>
     <div className="admin-tabs">{tabs.map(([key, label]) => <button className={tab === key ? 'active' : ''} key={key} onClick={() => setTab(key)}>{label}</button>)}</div>
-    {tab === 'fleet' && <div className="admin-split"><div className="table-card"><div className="table-title"><h3>Fleet inventory</h3></div><div className="table-scroll"><table><thead><tr><th>Vehicle</th><th>Type</th><th>Daily rate</th><th>Availability</th></tr></thead><tbody>{data.vehicles.map((v) => <tr key={v.id}><td><strong>{v.brand} {v.model}</strong><small>{v.id}</small></td><td>{v.type}</td><td>{money(v.dailyRate)}</td><td><span className={`status ${v.available ? 'confirmed' : 'cancelled'}`}>{v.available ? 'Available' : 'Unavailable'}</span></td></tr>)}</tbody></table></div></div><form className="form-card" onSubmit={onCreateVehicle}><h3>Add or update a vehicle</h3><label>Vehicle ID<input name="id" required /></label><div className="form-pair"><label>Brand<input name="brand" required /></label><label>Model<input name="model" required /></label></div><div className="form-pair"><label>Type<select name="type"><option>Car</option><option>SUV</option><option>Van</option><option>Bike</option></select></label><label>Daily rate<input name="dailyRate" type="number" min="1" step="0.01" required /></label></div><button className="button button-dark full">Save vehicle <span>↗</span></button><small>Saving an existing vehicle ID updates its descriptive fields through the repository.</small></form></div>}
+    {tab === 'fleet' && <div className="admin-split"><div className="table-card"><div className="table-title"><h3>Fleet inventory</h3></div><div className="table-scroll"><table><thead><tr><th>Vehicle</th><th>Type</th><th>Daily rate</th><th>Availability</th></tr></thead><tbody>{data.vehicles.map((v) => <tr key={v.id}><td><strong>{v.brand} {v.model}</strong><small>{v.id}</small></td><td>{v.type}</td><td>{money(v.dailyRate)}</td><td><span className={`status ${v.available ? 'confirmed' : 'cancelled'}`}>{v.available ? 'Available' : 'Unavailable'}</span></td></tr>)}</tbody></table></div></div><form className="form-card" onSubmit={onCreateVehicle}><h3>Add a vehicle</h3><label>Vehicle ID<input name="id" required /></label><div className="form-pair"><label>Brand<input name="brand" required /></label><label>Model<input name="model" required /></label></div><div className="form-pair"><label>Type<select name="type"><option>Car</option><option>SUV</option><option>Van</option><option>Bike</option></select></label><label>Daily rate<input name="dailyRate" type="number" min="1" step="0.01" required /></label></div><button className="button button-dark full">Save vehicle <span>↗</span></button><small>Vehicle IDs must be unique; existing vehicles are not overwritten.</small></form></div>}
     {tab === 'bookings' && <div className="table-card"><div className="table-title"><h3>All bookings</h3></div><div className="table-scroll"><table><thead><tr><th>Booking</th><th>Customer</th><th>Vehicle</th><th>Dates</th><th>Status</th><th /></tr></thead><tbody>{data.bookings.map((b) => <tr key={b.bookingId}><td>{b.bookingId}</td><td>{b.customerId}</td><td>{b.vehicleId}</td><td>{b.startDate}<small>to {b.endDate}</small></td><td><span className={`status ${b.status.toLowerCase()}`}>{b.status}</span></td><td>{b.status !== 'CANCELLED' && <button className="link-button" onClick={() => onCancel(b.bookingId)}>Cancel</button>}</td></tr>)}</tbody></table></div></div>}
     {tab === 'maintenance' && <div className="table-card"><div className="table-title"><h3>Maintenance overview</h3><span>Scheduling and completion remain in the backend workflow.</span></div><div className="table-scroll"><table><thead><tr><th>Record</th><th>Vehicle</th><th>Service date</th><th>Description</th><th>Cost</th><th>Status</th></tr></thead><tbody>{data.maintenance.map((m) => <tr key={m.maintenanceId}><td>{m.maintenanceId}</td><td>{m.vehicleId}</td><td>{m.serviceDate}</td><td>{m.description}</td><td>{money(m.maintenanceCost)}</td><td><span className={`status ${m.status.toLowerCase()}`}>{m.status}</span></td></tr>)}</tbody></table></div></div>}
     {tab === 'rentals' && <div className="table-card"><div className="table-title"><h3>Rental records</h3><span>Existing rental and return records</span></div><div className="table-scroll"><table><thead><tr><th>Rental</th><th>Booking</th><th>Planned return</th><th>Actual return</th><th>Late fee/day</th><th>Status</th></tr></thead><tbody>{data.rentals.map((r) => <tr key={r.rentalId}><td>{r.rentalId}</td><td>{r.bookingId}</td><td>{r.plannedReturnDate}</td><td>{r.actualReturnDate || '—'}</td><td>{money(r.dailyLateFee)}</td><td>{r.returned ? 'Returned' : 'Active'}</td></tr>)}</tbody></table></div></div>}

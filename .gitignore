@@ -20,3 +20,8 @@ backend/build*/
 *.dll
 *.o
 *.obj
+
+# Node.js backend
+backend-node/node_modules/
+backend-node/coverage/
+backend-node/*.log

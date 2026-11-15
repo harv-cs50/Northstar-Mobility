@@ -1,0 +1,25 @@
+{
+  "name": "northstar-vrms-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "start:e2e-mock": "node scripts/start-e2e-mock-server.js",
+    "test": "node --test",
+    "db:setup:test": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-postgres-test.ps1",
+    "test:integration": "node --test integration/postgres.integration.js"
+  },
+  "dependencies": {
+    "argon2": "^0.45.2",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "nodemailer": "^10.5.0",
+    "pdfkit": "^0.20.2",
+    "pg": "^8.16.3",
+    "zod": "^4.1.12"
+  }
+}
