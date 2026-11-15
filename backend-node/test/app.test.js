@@ -107,9 +107,19 @@ describe('environment configuration', () => {
       database: validEnvironment.PGDATABASE,
       user: validEnvironment.PGUSER,
       password: validEnvironment.PGPASSWORD,
+      ssl: false,
       application_name: 'northstar-vrms-api',
       max: 10,
     });
+  });
+
+  it('requires certificate verification for production PostgreSQL connections', () => {
+    const config = loadConfig({
+      ...validEnvironment,
+      NODE_ENV: 'production',
+    });
+
+    assert.deepEqual(config.database.ssl, { rejectUnauthorized: true });
   });
 });
 

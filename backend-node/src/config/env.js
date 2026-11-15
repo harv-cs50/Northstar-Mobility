@@ -48,13 +48,16 @@ export function loadConfig(environment = process.env) {
     adminBootstrapToken: values.VRMS_ADMIN_BOOTSTRAP_TOKEN,
     invoiceTaxPercent: values.VRMS_INVOICE_TAX_PERCENT,
     database: {
-      host: values.PGHOST,
-      port: values.PGPORT,
-      database: values.PGDATABASE,
-      user: values.PGUSER,
-      password: values.PGPASSWORD,
-      application_name: 'northstar-vrms-api',
-      max: 10,
-    },
+  host: values.PGHOST,
+  port: values.PGPORT,
+  database: values.PGDATABASE,
+  user: values.PGUSER,
+  password: values.PGPASSWORD,
+  ssl: values.NODE_ENV === 'production'
+    ? { rejectUnauthorized: true }
+    : false,
+  application_name: 'northstar-vrms-api',
+  max: 10,
+},
   };
 }
